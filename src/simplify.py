@@ -5,6 +5,7 @@ import io
 import os
 import re
 import sys
+import ast
 import traceback
 try: import z3
 except ModuleNotFoundError: pass
@@ -620,6 +621,45 @@ def simplify_linear_mba(expr, bitCount, useZ3, checkLinear=False):
     simpl = simplifier.simplify(useZ3)
     return simpl
 
+def prettify(formula):
+    def traverse(node):
+        if isinstance(node, ast.Module):
+            return traverse(node.body[0])
+        if isinstance(node, ast.Expr):
+            return traverse(node.value)
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Constant):
+            return "0u"+str(node.value)
+        if isinstance(node, ast.BinOp):
+            return "(" + traverse(node.left) + " " + traverse(node.op) + " " + traverse(node.right) + ")"
+        if isinstance(node, ast.UnaryOp):
+            return "(" + traverse(node.op) + " " + traverse(node.operand) + ")"
+        if isinstance(node, ast.Add):
+            return "bvadd" if not prettify else "+"
+        if isinstance(node, ast.Sub):
+            return "bvsub" if not prettify else "-"
+        if isinstance(node, ast.Mult):
+            return "bvmul" if not prettify else "*"
+        if isinstance(node, ast.Div):
+            return "bvudiv" if not prettify else "/"
+        if isinstance(node, ast.Mod):
+            return "bvurem" if not prettify else "%"
+        if isinstance(node, ast.LShift):
+            return "bvshl" if not prettify else "<<"
+        if isinstance(node, ast.RShift):
+            return "bvlshr" if not prettify else ">>"
+        if isinstance(node, ast.BitOr):
+            return "bvor" if not prettify else "|"
+        if isinstance(node, ast.BitXor):
+            return "bvxor" if not prettify else "^"
+        if isinstance(node, ast.BitAnd):
+            return "bvand" if not prettify else "&"
+        if isinstance(node, ast.USub):
+            return "bvneg" if not prettify else "-"
+        if isinstance(node, ast.Invert):
+            return "bvnot" if not prettify else "~"
+    return traverse(ast.parse(formula))
 
 # Print options.
 def print_usage():
@@ -668,8 +708,8 @@ if __name__ == "__main__":
         sys.exit("No expressions to simplify given!")
 
     for expr in expressions:
-        print("*** Expression " + expr)
+        # print("*** Expression " + expr)
         simpl = simplify_linear_mba(expr, bitCount, useZ3, checkLinear)
-        print("*** ... simplified to " + simpl)
+        print(prettify(simpl))
 
     sys.exit(0)
