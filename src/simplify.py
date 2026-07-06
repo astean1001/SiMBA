@@ -587,6 +587,175 @@ class Simplifier():
         return str(result) == "unsat"
 
     # Simplify the expression with used number of variables.
+
+    # Basis search: render the linear result vector as the smallest exact integer
+    # combination of bitwise bases from a generated pool (see patches/README.md).
+    _pool_cache = {}
+
+    def _bsearch_signed(self, v):
+        v %= self.modulus
+        return v - self.modulus if v > self.modulus // 2 else v
+
+    def _bsearch_eval_term(self, term):
+        vec = []
+        for i in range(2 ** self.vnumber):
+            n = i
+            X = []
+            for j in range(self.vnumber):
+                X.append(n & 1)
+                n = n >> 1
+            vec.append(self._bsearch_signed(self.mod_red(eval(term))))
+        return vec
+
+    def _bsearch_pool(self):
+        import os
+        n = self.vnumber
+        if n not in (1, 2, 3):
+            return []
+        maxsize = int(os.environ.get("SIMBA_BSEARCH_MAXSIZE", "6"))
+        key = (n, maxsize)
+        cached = Simplifier._pool_cache.get(key)
+        if cached is not None:
+            return cached
+        full = (1 << (2 ** n)) - 1
+        best = {}
+        for j in range(n):
+            tt = 0
+            for a in range(2 ** n):
+                if (a >> j) & 1:
+                    tt |= (1 << a)
+            best[tt] = ("X[%d]" % j, 1)
+        for size in range(2, maxsize + 1):
+            for tt, (s, sz) in list(best.items()):
+                if sz + 1 == size:
+                    ntt = (~tt) & full
+                    ns = ("~%s" % s) if (s[0] in "(X~") else "~(%s)" % s
+                    if ntt not in best or best[ntt][1] > sz + 1:
+                        best[ntt] = (ns, sz + 1)
+            for la in range(1, size - 1):
+                lb = size - 1 - la
+                Ls = [(t, v) for t, v in best.items() if v[1] == la]
+                Rs = [(t, v) for t, v in best.items() if v[1] == lb]
+                for tl, (sl, _) in Ls:
+                    for tr, (sr, _) in Rs:
+                        for op, f in (("&", tl & tr), ("|", tl | tr), ("^", tl ^ tr)):
+                            ntt = f & full
+                            if ntt not in best or best[ntt][1] > size:
+                                best[ntt] = ("(%s%s%s)" % (sl, op, sr), size)
+        pool = ["1"]
+        for tt, (s, sz) in best.items():
+            if tt == 0 or tt == full:
+                continue
+            pool.append(s)
+        Simplifier._pool_cache[key] = pool
+        return pool
+
+    def _bsearch_solve_sub(self, cols, R):
+        n = len(R)
+        k = len(cols)
+        M = [[cols[c][r] for c in range(k)] + [R[r]] for r in range(n)]
+        for c in range(k):
+            piv = None
+            for i in range(c, n):
+                if M[i][c] != 0:
+                    piv = i
+                    break
+            if piv is None:
+                return None
+            M[c], M[piv] = M[piv], M[c]
+            pc = M[c][c]
+            for i in range(n):
+                if i != c and M[i][c] != 0:
+                    fi = M[i][c]
+                    M[i] = [M[i][j] * pc - fi * M[c][j] for j in range(k + 1)]
+        for i in range(k, n):
+            if any(M[i][j] != 0 for j in range(k + 1)):
+                return None
+        out = []
+        for c in range(k):
+            p = M[c][c]
+            v = M[c][k]
+            if p == 0 or v % p != 0:
+                return None
+            out.append(v // p)
+        return out
+
+    def _bsearch_render(self, basis, coeffs):
+        terms = []
+        for term, c in zip(basis, coeffs):
+            c = self._bsearch_signed(c)
+            if c == 0:
+                continue
+            if term == "1":
+                terms.append(str(c))
+            elif c == 1:
+                terms.append(term)
+            elif c == -1:
+                terms.append("-" + term)
+            else:
+                terms.append(str(c) + "*" + term)
+        if not terms:
+            return "0"
+        expr = terms[0]
+        for t in terms[1:]:
+            expr += t if t.startswith("-") else ("+" + t)
+        return expr
+
+    def _bsearch_size(self, expr):
+        # ProMBA AST-size metric: leaf = 1, unary = 1 + child, binary = 1 + l + r.
+        try:
+            tree = ast.parse(expr, mode="eval")
+        except Exception:
+            return 10 ** 9
+        def sz(node):
+            if isinstance(node, ast.Expression):
+                return sz(node.body)
+            if isinstance(node, ast.BinOp):
+                return 1 + sz(node.left) + sz(node.right)
+            if isinstance(node, ast.UnaryOp):
+                return 1 + sz(node.operand)
+            if isinstance(node, (ast.Name, ast.Constant, ast.Subscript)):
+                return 1
+            return 0
+        return sz(tree)
+
+    def simplify_by_basis_search(self):
+        if self.vnumber not in (1, 2, 3):
+            return None
+        import os, time
+        from itertools import combinations
+        self.init_result_vector()
+        R = [self._bsearch_signed(v) for v in self.resultVector]
+        pool = self._bsearch_pool()
+        cache = {}
+        def vec(t):
+            if t not in cache:
+                cache[t] = self._bsearch_eval_term(t)
+            return cache[t]
+        budget = float(os.environ.get("SIMBA_BSEARCH_TIME", "2.0"))
+        lookahead = int(os.environ.get("SIMBA_BSEARCH_LOOKAHEAD", "1"))
+        start = time.time()
+        best, best_size = None, None
+        first_k = None
+        for k in range(1, len(R) + 1):
+            if k > len(pool):
+                break
+            if first_k is not None and k > first_k + lookahead:
+                break
+            for sub in combinations(pool, k):
+                if time.time() - start > budget:
+                    return best
+                coeffs = self._bsearch_solve_sub([vec(t) for t in sub], R)
+                if coeffs is None:
+                    continue
+                expr = self._bsearch_render(list(sub), coeffs)
+                sz = self._bsearch_size(expr)
+                if best is None or sz < best_size:
+                    best, best_size = expr, sz
+            if best is not None and first_k is None:
+                first_k = k
+        return best
+
     def simplify(self, useZ3):
         if self.vnumber > 3:
             simpl = self.simplify_generic()
@@ -601,6 +770,9 @@ class Simplifier():
             else:
                 simpl = self.simplify_generic()
                 simpl = self.try_refine(simpl)
+                alt = self.simplify_by_basis_search()
+                if alt is not None and self._bsearch_size(alt) < self._bsearch_size(simpl):
+                    simpl = alt
 
         if useZ3 and not self.verify_mba_unsat(simpl):
             sys.exit("Error in simplification! Simplified expression is not equivalent to original one!")
